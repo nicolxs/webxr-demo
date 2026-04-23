@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>AR Print Preview</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; background: #111; color: white; }
+    #overlay {
+      position: absolute; inset: 0; display: flex; flex-direction: column;
+      justify-content: center; align-items: center; background: rgba(0,0,0,0.88);
+      z-index: 10; text-align: center; padding: 24px;
+    }
+    #overlay h1 { margin: 0 0 12px; font-size: 26px; }
+    #overlay p { margin: 0 0 24px; color: #bbb; max-width: 420px; line-height: 1.5; font-size: 15px; }
+    #start-btn {
+      padding: 14px 32px; font-size: 18px; background: #e53935; color: white;
+      border: none; border-radius: 10px; cursor: pointer; font-weight: 600;
+    }
+    #start-btn:disabled { background: #555; cursor: not-allowed; }
+    .note { font-size: 12px; color: #888; margin-top: 16px; }
+    #info {
+      position: absolute; bottom: 32px; left: 50%; transform: translateX(-50%);
+      background: rgba(0,0,0,0.6); color: white; padding: 10px 22px;
+      border-radius: 24px; pointer-events: none; display: none; font-size: 14px;
+    }
+    canvas { display: block; }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+
+  <div id="overlay">
+    <h1>3D Print AR Preview</h1>
+    <p>Preview your model at real-world scale before committing filament. Tap the red ring to place it on any flat surface.</p>
+    <button id="start-btn" disabled>Checking WebXR…</button>
+    <p class="note">Android Chrome recommended. For iOS, see the cross-platform note below.</p>
+  </div>
+
+  <div id="info">Tap the red ring to place your model</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { ARButton } from 'three/addons/webxr/ARButton.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+
+    let camera, scene, renderer, reticle, model;
+    let hitTestSource = null;
+    let hitTestSourceRequested = false;
+
+    const overlay = document.getElementById('overlay');
+    const info    = document.getElementById('info');
+    const btn     = document.getElementById('start-btn');
+
+    init();
+
+    async function init() {
+      // 1. Check for WebXR AR support
+      if (!('xr' in navigator)) {
+        btn.textContent = 'WebXR Not Supported';
+        return;
+      }
+      const ok = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+      if (!ok) {
+        btn.textContent = 'AR Not Available (Use Android Chrome)';
+        return;
+      }
+
+      btn.disabled = false;
+      btn.textContent = 'Start AR Preview';
+
+      // 2. Build scene
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+      hemi.position.set(0, 20, 0);
+      scene.add(hemi);
+
+      const dir = new THREE.DirectionalLight(0xffffff, 1.5);
+      dir.position.set(5, 10, 7);
+      scene.add(dir);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      // 3. Placement reticle (red ring)
+      const geo = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2);
+      const mat = new THREE.MeshBasicMaterial({ color: 0xe53935 });
+      reticle = new THREE.Mesh(geo, mat);
+      reticle.visible = false;
+      scene.add(reticle);
+
+      // 4. Load model (GLB preferred, OBJ fallback)
+      await loadModel();
+
+      // 5. Tap to place
+      const controller = renderer.xr.getController(0);
+      controller.addEventListener('select', onSelect);
+      scene.add(controller);
+
+      // 6. Hidden ARButton triggers the session
+      const arBtn = ARButton.createButton(renderer, { requiredFeatures: ['hit-test'] });
+      arBtn.style.display = 'none';
+      document.body.appendChild(arBtn);
+
+      btn.addEventListener('click', () => {
+        overlay.style.display = 'none';
+        info.style.display = 'block';
+        arBtn.click();
+        renderer.setAnimationLoop(animate);
+      });
+
+      window.addEventListener('resize', onWindowResize);
+    }
+
+    function loadModel() {
+      return new Promise((resolve) => {
+        // Try GLB first
+        new GLTFLoader().load('model.glb', (gltf) => {
+          model = gltf.scene;
+          normalizeModel(model);
+          resolve();
+        }, undefined, () => {
+          // Fallback to OBJ
+          new OBJLoader().load('model.obj', (obj) => {
+            model = obj;
+            normalizeModel(obj);
+            // OBJs often lack materials; apply a default red plastic look
+            obj.traverse((child) => {
+              if (child.isMesh) {
+                child.material = new THREE.MeshStandardMaterial({
+                  color: 0xd32f2f, roughness: 0.3, metalness: 0.1
+                });
+              }
+            });
+            resolve();
+          }, undefined, (err) => {
+            console.error(err);
+            // Ultimate fallback: a box roughly the size of your LEGO brick
+            const b = new THREE.Mesh(
+              new THREE.BoxGeometry(0.032, 0.016, 0.010),
+              new THREE.MeshStandardMaterial({ color: 0xd32f2f })
+            );
+            model = b;
+            resolve();
+          });
+        });
+      });
+    }
+
+    function normalizeModel(obj) {
+      // Detect if the model is in millimeters (common from CAD/3D printers)
+      // and convert to meters so 1 Three.js unit = 1 meter in AR.
+      const box = new THREE.Box3().setFromObject(obj);
+      const size = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size.x, size.y, size.z);
+
+      let scale = 1;
+      if (maxDim > 10)       scale = 0.001;   // mm → m
+      else if (maxDim > 0.5) scale = 0.01;    // cm → m (optional safety)
+      obj.scale.setScalar(scale);
+
+      // Recompute after scaling and center the model
+      const scaledBox = new THREE.Box3().setFromObject(obj);
+      const center = scaledBox.getCenter(new THREE.Vector3());
+      obj.position.sub(center);
+    }
+
+    function onSelect() {
+      if (!reticle.visible || !model) return;
+
+      const placed = model.clone();
+      placed.position.setFromMatrixPosition(reticle.matrix);
+
+      // Lift it so the bottom sits ON the surface, not through it
+      const box = new THREE.Box3().setFromObject(placed);
+      const height = box.getSize(new THREE.Vector3()).y;
+      placed.position.y += height / 2;
+
+      scene.add(placed);
+      info.textContent = 'Model placed. Tap again to add another.';
+    }
+
+    function animate(timestamp, frame) {
+      if (frame) {
+        const refSpace = renderer.xr.getReferenceSpace();
+        const session = renderer.xr.getSession();
+
+        if (!hitTestSourceRequested) {
+          session.requestReferenceSpace('viewer').then((viewerSpace) => {
+            session.requestHitTestSource({ space: viewerSpace }).then((src) => {
+              hitTestSource = src;
+            });
+          });
+          session.addEventListener('end', () => {
+            hitTestSourceRequested = false;
+            hitTestSource = null;
+            overlay.style.display = 'flex';
+            info.style.display = 'none';
+          });
+          hitTestSourceRequested = true;
+        }
+
+        if (hitTestSource) {
+          const hits = frame.getHitTestResults(hitTestSource);
+          if (hits.length > 0) {
+            const pose = hits[0].getPose(refSpace);
+            reticle.visible = true;
+            reticle.matrix.fromArray(pose.transform.matrix);
+          } else {
+            reticle.visible = false;
+          }
+        }
+      }
+      renderer.render(scene, camera);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+  </script>
+</body>
+</html>
