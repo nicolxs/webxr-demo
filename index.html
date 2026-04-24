@@ -50,7 +50,6 @@
     }
     #ar-ui.active { display: block; }
 
-    /* Make only the interactive containers receive pointer events */
     #mode-bar, #color-panel {
       pointer-events: auto;
     }
@@ -226,13 +225,14 @@ const CONFIG = {
   DRAG_THRESHOLD: 6,
   PLACEMENT_ANIM_MS: 380,
   MIN_SCALE: 0.05,
-  MAX_SCALE: 10,
+  MAX_SCALE: 3.0,            // tighter upper bound for real-world models
   OSI_MARGIN: 28,
   OSI_UPDATE_INTERVAL: 100,
   PINCH_SELECT_COOLDOWN: 400,
   TRACKING_LOST_DELAY: 2000,
   HIT_TEST_RETRY_MS: 500,
   MAX_PIXEL_RATIO: 2,
+  PINCH_SCALE_SPEED: 0.005,  // how much 1px pinch changes scale
 };
 
 /* ========================================================
@@ -249,8 +249,10 @@ let dragDist    = 0;
 let wasDragging = false;
 let t0X = 0, t0Y = 0;
 let rotStartY   = 0;
-let pinchStartD = 0;
-let pinchStartS = 1;
+
+// ── Pinch state (rewritten) ──
+let pinchStartDist = 0;       // pixel distance when pinch began
+let pinchStartScale = 1;      // model scale when pinch began
 let isPinching  = false;
 let lastPinchEndTime = 0;
 
@@ -441,21 +443,25 @@ function updateOSI() {
 }
 
 /* ========================================================
-   TOUCH HANDLING – only for pinch and drag manipulation
+   TOUCH HANDLING – fixed pinch
    ======================================================== */
+function getTouchDist(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.hypot(dx, dy);
+}
+
 document.addEventListener('touchstart', e => {
   dragDist = 0;
   wasDragging = false;
-  if (e.touches.length === 2) {
+
+  if (e.touches.length === 2 && selectedModel && activeMode === 'scale') {
+    // Start pinch
     isPinching = true;
-    const dx = e.touches[0].clientX - e.touches[1].clientX;
-    const dy = e.touches[0].clientY - e.touches[1].clientY;
-    pinchStartD = Math.hypot(dx, dy);
-    pinchStartS = selectedModel ? selectedModel.scale.x : 1;
-  } else {
+    pinchStartDist = getTouchDist(e.touches);
+    pinchStartScale = selectedModel.scale.x;
+  } else if (e.touches.length === 1) {
     isPinching = false;
-  }
-  if (e.touches.length === 1) {
     t0X = e.touches[0].clientX;
     t0Y = e.touches[0].clientY;
     rotStartY = selectedModel ? selectedModel.rotation.y : 0;
@@ -464,15 +470,17 @@ document.addEventListener('touchstart', e => {
 
 document.addEventListener('touchmove', e => {
   if (!selectedModel) return;
-  if (e.touches.length === 2 && activeMode === 'scale') {
-    const dx = e.touches[0].clientX - e.touches[1].clientX;
-    const dy = e.touches[0].clientY - e.touches[1].clientY;
-    const dist = Math.hypot(dx, dy);
-    const ratio = dist / (pinchStartD || 1);
-    selectedModel.scale.setScalar(
-      Math.max(CONFIG.MIN_SCALE, Math.min(CONFIG.MAX_SCALE, pinchStartS * ratio))
-    );
-    wasDragging = true;
+
+  if (e.touches.length === 2 && isPinching && activeMode === 'scale') {
+    // Scale based on ratio from initial pinch distance
+    const currentDist = getTouchDist(e.touches);
+    if (pinchStartDist > 0) {
+      const ratio = currentDist / pinchStartDist;
+      const newScale = pinchStartScale * ratio;
+      const clamped = Math.max(CONFIG.MIN_SCALE, Math.min(CONFIG.MAX_SCALE, newScale));
+      selectedModel.scale.setScalar(clamped);
+      wasDragging = true;
+    }
   } else if (e.touches.length === 1 && (activeMode === 'rotate' || activeMode === 'place')) {
     const dx = e.touches[0].clientX - t0X;
     const dy = e.touches[0].clientY - t0Y;
@@ -486,10 +494,19 @@ document.addEventListener('touchmove', e => {
 
 document.addEventListener('touchend', e => {
   if (isPinching && e.touches.length < 2) {
+    // Pinch ended
     lastPinchEndTime = performance.now();
     wasDragging = true;
     isPinching = false;
+
+    // Show scale feedback
+    if (selectedModel) {
+      const s = selectedModel.scale.x;
+      showToast(`Scale: ${(s * 100).toFixed(0)}%`);
+    }
   }
+
+  // Clear wasDragging after cooldown
   setTimeout(() => {
     if (performance.now() - lastPinchEndTime > CONFIG.PINCH_SELECT_COOLDOWN) {
       wasDragging = false;
@@ -498,10 +515,9 @@ document.addEventListener('touchend', e => {
 }, { passive: true });
 
 /* ========================================================
-   UI BUTTONS – simple click handlers, no over-engineering
+   UI BUTTONS
    ======================================================== */
 
-// Build color swatches
 PALETTE.forEach((c, i) => {
   const el = document.createElement('div');
   el.className = 'swatch' + (i === 0 ? ' active' : '');
@@ -517,7 +533,6 @@ PALETTE.forEach((c, i) => {
   $colorPanel.appendChild(el);
 });
 
-// Mode buttons – unified handler for both mode and clear
 document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
   btn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -576,6 +591,7 @@ function placeModel() {
   placed.position.setFromMatrixPosition(reticle.matrix);
   placed.rotation.set(0, Math.random() * Math.PI * 2, 0);
 
+  // Position model so it sits on the surface
   const halfH = modelTemplate.userData?.halfHeight || 0;
   if (halfH) {
     placed.position.y += halfH;
