@@ -114,7 +114,7 @@
 
     #tracking-toast {
       position: absolute; top: 70px; left: 50%; transform: translateX(-50%);
-      background: rgba(255,152,0,0.88); backdrop-filter: blur(12px);
+      background: rgba(229,57,53,0.88); backdrop-filter: blur(12px);
       color: #fff; padding: 8px 22px; border-radius: 20px;
       font-size: 12px; letter-spacing: 0.6px; pointer-events: none;
       opacity: 0; transition: opacity 0.25s; white-space: nowrap;
@@ -187,7 +187,7 @@
 
 <div id="ar-ui">
   <div id="info-bar">TAP RING TO PLACE</div>
-  <div id="tracking-toast">TRACKING LOST — MOVE SLOWLY</div>
+  <div id="tracking-toast">POINT AT A FLAT SURFACE</div>
   <div id="color-panel"></div>
   <div id="mode-bar">
     <button class="mode-btn active" id="btn-place" data-mode="place">＋ PLACE</button>
@@ -207,7 +207,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader }  from 'three/addons/loaders/OBJLoader.js';
 
 /* ========================================================
-   CONFIGURATION – tune for low‑end devices
+   CONFIGURATION
    ======================================================== */
 const CONFIG = {
   ROTATION_SENSITIVITY: 0.009,
@@ -218,9 +218,11 @@ const CONFIG = {
   OSI_MARGIN: 28,
   MODEL_PATH_GLB: 'model.glb',
   MODEL_PATH_OBJ: 'model.obj',
-  MAX_PIXEL_RATIO: 2,           // cap for performance
-  OSI_UPDATE_INTERVAL: 100,     // ms – throttle OSI position updates
-  PINCH_SELECT_COOLDOWN: 400,   // ms – block select after pinch ends
+  MAX_PIXEL_RATIO: 2,
+  OSI_UPDATE_INTERVAL: 100,
+  PINCH_SELECT_COOLDOWN: 400,
+  TRACKING_LOST_DELAY: 2000,   // ms before showing "tracking lost" toast
+  HIT_TEST_RETRY_MS: 500,      // retry hit‑test source if first attempts fail
 };
 
 /* ========================================================
@@ -240,11 +242,12 @@ let rotStartY   = 0;
 let pinchStartD = 0;
 let pinchStartS = 1;
 let isPinching  = false;
-let lastPinchEndTime = 0; // suppress select after pinch
+let lastPinchEndTime = 0;
 
 let trackingLost = false;
-let trackingToastTimer = null;
-let lastOSIUpdate = 0;
+let lastHitTime = 0;                // timestamp when last hit was received
+let trackingLostToastTimer = null;
+let hitTestRetryTimer = null;
 
 const animations = new Map();
 
@@ -281,15 +284,20 @@ function showToast(msg, ms = 2200) {
   window._toastTimer = setTimeout(() => $toast.classList.remove('show'), ms);
 }
 
-function showTrackingToast(msg, ms = 0) {
+function showTrackingToast(msg, isPersistent = false) {
   $trackingToast.textContent = msg;
   $trackingToast.classList.add('show');
-  clearTimeout(trackingToastTimer);
-  if (ms > 0) trackingToastTimer = setTimeout(() => $trackingToast.classList.remove('show'), ms);
+  clearTimeout(trackingLostToastTimer);
+  if (!isPersistent) {
+    trackingLostToastTimer = setTimeout(() => {
+      $trackingToast.classList.remove('show');
+    }, CONFIG.TRACKING_LOST_DELAY);
+  }
 }
+
 function hideTrackingToast() {
   $trackingToast.classList.remove('show');
-  clearTimeout(trackingToastTimer);
+  clearTimeout(trackingLostToastTimer);
 }
 
 function setMode(m) {
@@ -417,7 +425,7 @@ function updateOSI() {
 }
 
 /* ========================================================
-   ROBUST TOUCH HANDLING (including pinch & select block)
+   TOUCH HANDLING (pinch + drag)
    ======================================================== */
 document.addEventListener('touchstart', e => {
   dragDist = 0;
@@ -440,10 +448,7 @@ document.addEventListener('touchstart', e => {
 
 document.addEventListener('touchmove', e => {
   if (!selectedModel) return;
-
-  if (e.touches.length === 2) {
-    // pinch scaling
-    if (activeMode !== 'scale') return;
+  if (e.touches.length === 2 && activeMode === 'scale') {
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     const dist = Math.hypot(dx, dy);
@@ -465,12 +470,10 @@ document.addEventListener('touchmove', e => {
 
 document.addEventListener('touchend', e => {
   if (isPinching && e.touches.length < 2) {
-    // pinch just ended
     lastPinchEndTime = performance.now();
-    wasDragging = true;   // block next select
+    wasDragging = true;
     isPinching = false;
   }
-  // keep wasDragging true for a while so the AR select event is skipped
   setTimeout(() => {
     if (performance.now() - lastPinchEndTime > CONFIG.PINCH_SELECT_COOLDOWN) {
       wasDragging = false;
@@ -479,7 +482,7 @@ document.addEventListener('touchend', e => {
 }, { passive: true });
 
 /* ========================================================
-   UI BUTTON FIXES – prevent AR select events on the UI
+   UI BUTTON FIXES – pointer capture to avoid AR hijack
    ======================================================== */
 function stopAll(e) {
   e.preventDefault();
@@ -487,7 +490,6 @@ function stopAll(e) {
   e.stopImmediatePropagation();
 }
 
-// Color swatches
 PALETTE.forEach((c, i) => {
   const el = document.createElement('div');
   el.className = 'swatch' + (i === 0 ? ' active' : '');
@@ -504,7 +506,6 @@ PALETTE.forEach((c, i) => {
   $colorPanel.appendChild(el);
 });
 
-// Mode buttons
 document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
   btn.addEventListener('pointerdown', stopAll);
   btn.addEventListener('pointerup', (e) => {
@@ -513,7 +514,6 @@ document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
   });
 });
 
-// Clear button – extra robust
 const clearBtn = document.getElementById('btn-clear');
 clearBtn.addEventListener('pointerdown', stopAll);
 clearBtn.addEventListener('pointerup', (e) => {
@@ -523,7 +523,6 @@ clearBtn.addEventListener('pointerup', (e) => {
   updateInfo();
 });
 
-// Prevent AR session from hijacking touches on the mode bar & color panel
 [$arUI, $colorPanel].forEach(el => {
   if (!el) return;
   el.addEventListener('touchstart', stopAll, { capture: true });
@@ -533,14 +532,13 @@ clearBtn.addEventListener('pointerup', (e) => {
 });
 
 /* ========================================================
-   SELECT & PLACE (blocked after pinch)
+   SELECT & PLACE
    ======================================================== */
 const _raycaster = new THREE.Raycaster();
 const _selectOrigin = new THREE.Vector3();
 const _selectDirection = new THREE.Vector3();
 
 function onSelect() {
-  // block if dragging or just finished a pinch
   if (wasDragging || (performance.now() - lastPinchEndTime < CONFIG.PINCH_SELECT_COOLDOWN)) {
     wasDragging = false;
     return;
@@ -572,7 +570,6 @@ function onSelect() {
     }
   }
 
-  // No hit: place new model (only in 'place' mode)
   if (activeMode !== 'place' && !selectedModel) return;
   if (activeMode !== 'place') { deselect(); return; }
   if (!reticle.visible || !modelTemplate) return;
@@ -584,7 +581,6 @@ function placeModel() {
   placed.position.setFromMatrixPosition(reticle.matrix);
   placed.rotation.set(0, Math.random() * Math.PI * 2, 0);
 
-  // use pre‑computed half‑height to avoid Box3 calculation every time
   const halfH = modelTemplate.userData?.halfHeight || 0;
   if (halfH) {
     placed.position.y += halfH;
@@ -607,9 +603,6 @@ function placeModel() {
   updateInfo();
 }
 
-/* ========================================================
-   CLEANUP (properly disposes everything)
-   ======================================================== */
 function clearAllModels() {
   placedModels.forEach(m => {
     animations.delete(m);
@@ -651,7 +644,6 @@ async function init() {
 
   scene  = new THREE.Scene();
 
-  // low‑power friendly lighting
   const ambient = new THREE.AmbientLight(0xcccccc, 1.2);
   scene.add(ambient);
   const dir = new THREE.DirectionalLight(0xffffff, 1.0);
@@ -666,7 +658,7 @@ async function init() {
   renderer.xr.enabled = true;
   document.body.appendChild(renderer.domElement);
 
-  const rGeo = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI/2); // fewer segments
+  const rGeo = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI/2);
   reticle = new THREE.Mesh(rGeo, new THREE.MeshBasicMaterial({ color: 0xe53935, transparent: true }));
   reticle.visible = false;
   reticle.matrixAutoUpdate = false;
@@ -674,7 +666,6 @@ async function init() {
 
   await loadModel();
   modelTemplate.userData = modelTemplate.userData || {};
-  // pre‑compute half‑height for fast placement
   const box = new THREE.Box3().setFromObject(modelTemplate);
   modelTemplate.userData.halfHeight = box.getSize(new THREE.Vector3()).y / 2;
 
@@ -693,6 +684,8 @@ async function init() {
   $btn.addEventListener('click', () => {
     $overlay.style.display = 'none';
     $arUI.classList.add('active');
+    // Show initial hint
+    showTrackingToast('POINT AT A FLAT SURFACE', true);
     arBtn.click();
     renderer.setAnimationLoop(onFrame);
     updateInfo();
@@ -705,6 +698,7 @@ async function init() {
     hitTestSource = null;
     trackingLost = false;
     hideTrackingToast();
+    clearTimeout(hitTestRetryTimer);
     clearAllModels();
   });
 
@@ -716,60 +710,91 @@ async function init() {
 }
 
 /* ========================================================
-   RENDER LOOP (throttled OSI, tracking loss detection)
+   RENDER LOOP (with diagnostic logs)
    ======================================================== */
+function requestHitTestSource(session) {
+  session.requestReferenceSpace('viewer').then(viewerSpace => {
+    return session.requestHitTestSource({ space: viewerSpace });
+  }).then(hitSource => {
+    hitTestSource = hitSource;
+    console.log('[AR] Hit test source obtained (viewer space)');
+  }).catch(() => {
+    console.warn('[AR] viewer hit-test failed, trying local space...');
+    session.requestReferenceSpace('local').then(localSpace => {
+      return session.requestHitTestSource({ space: localSpace });
+    }).then(hitSource => {
+      hitTestSource = hitSource;
+      console.log('[AR] Hit test source obtained (local space)');
+    }).catch(err => {
+      console.error('[AR] Hit test source unavailable:', err);
+      // Retry after a delay
+      clearTimeout(hitTestRetryTimer);
+      hitTestRetryTimer = setTimeout(() => {
+        if (!hitTestSource) {
+          console.log('[AR] Retrying hit-test source...');
+          requestHitTestSource(session);
+        }
+      }, CONFIG.HIT_TEST_RETRY_MS);
+    });
+  });
+}
+
 function onFrame(timestamp, frame) {
-  if (frame) {
-    const refSpace = renderer.xr.getReferenceSpace();
-    const session  = renderer.xr.getSession();
+  if (!frame) return;
 
-    if (!hitTestSourceRequested) {
-      session.requestReferenceSpace('viewer').then(vs =>
-        session.requestHitTestSource({ space: vs })
-      ).then(src => { hitTestSource = src; }).catch(() => {
-        // fallback to 'local' reference space
-        session.requestReferenceSpace('local').then(ls =>
-          session.requestHitTestSource({ space: ls })
-        ).then(src => { hitTestSource = src; }).catch(() => {});
-      });
-      hitTestSourceRequested = true;
-    }
+  const session = renderer.xr.getSession();
+  if (!session) return;
 
-    if (hitTestSource) {
-      const hits = frame.getHitTestResults(hitTestSource);
-      if (hits.length) {
-        const pose = hits[0].getPose(refSpace);
+  const refSpace = renderer.xr.getReferenceSpace();
+
+  if (!hitTestSourceRequested) {
+    requestHitTestSource(session);
+    hitTestSourceRequested = true;
+  }
+
+  if (hitTestSource) {
+    const hits = frame.getHitTestResults(hitTestSource);
+    const now = performance.now();
+
+    if (hits.length > 0) {
+      const pose = hits[0].getPose(refSpace);
+      if (pose) {
         reticle.visible = true;
         reticle.matrix.fromArray(pose.transform.matrix);
+        lastHitTime = now;
+
         if (trackingLost) {
           trackingLost = false;
           hideTrackingToast();
-        }
-      } else {
-        reticle.visible = false;
-        if (!trackingLost) {
-          trackingLost = true;
-          showTrackingToast('TRACKING LOST — MOVE SLOWLY');
+          console.log('[AR] Tracking recovered');
         }
       }
+    } else {
+      reticle.visible = false;
+      // Wait before declaring tracking lost
+      if (!trackingLost && now - lastHitTime > CONFIG.TRACKING_LOST_DELAY) {
+        trackingLost = true;
+        showTrackingToast('POINT AT A FLAT SURFACE');
+        console.log('[AR] No hit for', CONFIG.TRACKING_LOST_DELAY, 'ms – showing hint');
+      }
     }
-
-    // additional tracking check via viewer pose
-    if (!hitTestSource && frame.getViewerPose) {
+  } else {
+    // No hit-test source yet; rely on viewer pose to guess tracking
+    if (frame.getViewerPose) {
       const vp = frame.getViewerPose(refSpace);
       if (!vp && !trackingLost) {
         trackingLost = true;
-        showTrackingToast('TRACKING LOST — MOVE SLOWLY');
+        showTrackingToast('WAITING FOR TRACKING...', true);
+        console.log('[AR] Viewer pose lost – waiting');
       } else if (vp && trackingLost) {
         trackingLost = false;
         hideTrackingToast();
+        console.log('[AR] Viewer pose recovered');
       }
     }
   }
 
   const now = performance.now();
-
-  // placement animations
   animations.forEach((anim, m) => {
     const t = Math.min(1, (now - anim.startTime) / CONFIG.PLACEMENT_ANIM_MS);
     const ease = 1 - Math.pow(1 - t, 3);
@@ -777,24 +802,23 @@ function onFrame(timestamp, frame) {
     if (t >= 1) animations.delete(m);
   });
 
-  // reticle pulse
   if (reticle.visible) {
     const pulse = 1 + 0.1 * Math.sin(now * 0.005);
     reticle.scale.setScalar(pulse);
     reticle.material.opacity = 0.7 + 0.3 * Math.sin(now * 0.005);
   }
 
-  // OSI throttling – good for low‑end devices
-  if (placedModels.length > 0 && now - lastOSIUpdate > CONFIG.OSI_UPDATE_INTERVAL) {
+  if (placedModels.length > 0 && now - window._lastOSIUpdate > CONFIG.OSI_UPDATE_INTERVAL) {
     updateOSI();
-    lastOSIUpdate = now;
+    window._lastOSIUpdate = now;
   }
 
   renderer.render(scene, camera);
 }
+window._lastOSIUpdate = 0;
 
 /* ========================================================
-   MODEL LOADING & NORMALIZATION
+   MODEL LOADING
    ======================================================== */
 function normalizeModel(obj) {
   const box  = new THREE.Box3().setFromObject(obj);
