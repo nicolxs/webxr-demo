@@ -13,6 +13,7 @@
       background: #0c0c0c;
       color: #fff;
       touch-action: none;
+      -webkit-tap-highlight-color: transparent;
     }
 
     #overlay {
@@ -70,6 +71,7 @@
       border-radius: 4px; cursor: pointer;
       transition: background 0.15s, color 0.15s, border-color 0.15s;
       -webkit-tap-highlight-color: transparent;
+      user-select: none;
     }
     .mode-btn.active {
       background: rgba(229,57,53,0.75); border-color: #e53935;
@@ -97,6 +99,7 @@
       border: 2.5px solid transparent;
       transition: transform 0.15s, border-color 0.15s;
       -webkit-tap-highlight-color: transparent;
+      user-select: none;
     }
     .swatch.active { border-color: #fff; transform: scale(1.22); }
 
@@ -203,7 +206,9 @@ import { ARButton }   from 'three/addons/webxr/ARButton.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader }  from 'three/addons/loaders/OBJLoader.js';
 
-// ──────────────────── CONFIGURATION ────────────────────
+/* ========================================================
+   CONFIGURATION – tune for low‑end devices
+   ======================================================== */
 const CONFIG = {
   ROTATION_SENSITIVITY: 0.009,
   DRAG_THRESHOLD: 6,
@@ -213,9 +218,14 @@ const CONFIG = {
   OSI_MARGIN: 28,
   MODEL_PATH_GLB: 'model.glb',
   MODEL_PATH_OBJ: 'model.obj',
+  MAX_PIXEL_RATIO: 2,           // cap for performance
+  OSI_UPDATE_INTERVAL: 100,     // ms – throttle OSI position updates
+  PINCH_SELECT_COOLDOWN: 400,   // ms – block select after pinch ends
 };
-// ───────────────────────────────────────────────────────
 
+/* ========================================================
+   GLOBAL STATE
+   ======================================================== */
 let camera, scene, renderer, reticle, controller;
 let hitTestSource = null, hitTestSourceRequested = false;
 let modelTemplate  = null;
@@ -229,9 +239,12 @@ let t0X = 0, t0Y = 0;
 let rotStartY   = 0;
 let pinchStartD = 0;
 let pinchStartS = 1;
+let isPinching  = false;
+let lastPinchEndTime = 0; // suppress select after pinch
 
 let trackingLost = false;
 let trackingToastTimer = null;
+let lastOSIUpdate = 0;
 
 const animations = new Map();
 
@@ -258,36 +271,26 @@ const $trackingToast = document.getElementById('tracking-toast');
 const $colorPanel   = document.getElementById('color-panel');
 const $selFlash     = document.getElementById('sel-flash');
 
-PALETTE.forEach((c, i) => {
-  const el = document.createElement('div');
-  el.className = 'swatch' + (i === 0 ? ' active' : '');
-  el.style.background = c.css;
-  el.addEventListener('click', (e) => {
-    e.stopPropagation();
-    document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
-    el.classList.add('active');
-    colorIdx = i;
-    if (selectedModel) applyColor(selectedModel, c.three);
-    showToast('Color applied');
-  });
-  $colorPanel.appendChild(el);
-});
+/* ========================================================
+   UI HELPERS
+   ======================================================== */
+function showToast(msg, ms = 2200) {
+  $toast.textContent = msg;
+  $toast.classList.add('show');
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => $toast.classList.remove('show'), ms);
+}
 
-// Stop touch propagation on all UI buttons
-document.querySelectorAll('.mode-btn, .swatch').forEach(el => {
-  el.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
-  el.addEventListener('touchmove',  e => e.stopPropagation(), { passive: true });
-  el.addEventListener('touchend',   e => e.stopPropagation(), { passive: true });
-});
-
-document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
-  btn.addEventListener('click', () => setMode(btn.dataset.mode));
-});
-document.getElementById('btn-clear').addEventListener('click', () => {
-  clearAllModels();
-  showToast('All models cleared');
-  updateInfo();
-});
+function showTrackingToast(msg, ms = 0) {
+  $trackingToast.textContent = msg;
+  $trackingToast.classList.add('show');
+  clearTimeout(trackingToastTimer);
+  if (ms > 0) trackingToastTimer = setTimeout(() => $trackingToast.classList.remove('show'), ms);
+}
+function hideTrackingToast() {
+  $trackingToast.classList.remove('show');
+  clearTimeout(trackingToastTimer);
+}
 
 function setMode(m) {
   activeMode = m;
@@ -307,28 +310,6 @@ function updateInfo() {
   const has = !!selectedModel;
   const msgs = INFO_MSGS[activeMode] || [''];
   $infoBar.textContent = msgs[has ? 1 : 0];
-}
-
-let toastTimer;
-function showToast(msg, ms = 2200) {
-  $toast.textContent = msg;
-  $toast.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => $toast.classList.remove('show'), ms);
-}
-
-function showTrackingToast(msg, ms = 0) {
-  $trackingToast.textContent = msg;
-  $trackingToast.classList.add('show');
-  clearTimeout(trackingToastTimer);
-  if (ms > 0) {
-    trackingToastTimer = setTimeout(() => $trackingToast.classList.remove('show'), ms);
-  }
-}
-
-function hideTrackingToast() {
-  $trackingToast.classList.remove('show');
-  clearTimeout(trackingToastTimer);
 }
 
 function applyColor(obj, hex) {
@@ -381,7 +362,9 @@ function spawnRipple() {
   setTimeout(() => r.remove(), 600);
 }
 
-// ──────────────────── OSI (Off-Screen Indicators) ────────────────────
+/* ========================================================
+   OFF‑SCREEN INDICATORS (OSI)
+   ======================================================== */
 const osiEls = [];
 function getOSI(i) {
   if (!osiEls[i]) {
@@ -393,6 +376,7 @@ function getOSI(i) {
   }
   return osiEls[i];
 }
+
 const _projV = new THREE.Vector3();
 function updateOSI() {
   const W = window.innerWidth, H = window.innerHeight;
@@ -415,57 +399,51 @@ function updateOSI() {
       el.style.display = 'block';
       const cx = W / 2, cy = H / 2;
       let dx = sx - cx, dy = sy - cy;
-
-      // Compute angle BEFORE flipping for behind-camera
       let angle = Math.atan2(dy, dx);
       if (behind) {
-        dx = -dx;
-        dy = -dy;
-        angle += Math.PI; // Add 180° so arrow points toward object from screen edge
+        dx = -dx; dy = -dy;
+        angle += Math.PI;
       }
-
       const dirIdx = Math.round((angle / Math.PI) * 4 + 4) % 8;
       el.querySelector('.osi-dir').textContent = DIR8[dirIdx];
 
       const hw = cx - 44, hh = cy - 44;
       const ca = Math.abs(Math.cos(angle)), sa = Math.abs(Math.sin(angle));
       const t  = (hw * sa <= hh * ca) ? hw / (ca || 1e-6) : hh / (sa || 1e-6);
-
       el.style.left = (cx + Math.cos(angle) * t - 20) + 'px';
       el.style.top  = (cy + Math.sin(angle) * t - 20) + 'px';
     }
   });
 }
 
-// ──────────────────── TOUCH HANDLING ────────────────────
+/* ========================================================
+   ROBUST TOUCH HANDLING (including pinch & select block)
+   ======================================================== */
 document.addEventListener('touchstart', e => {
   dragDist = 0;
   wasDragging = false;
-  if (e.touches.length === 1) {
-    t0X = e.touches[0].clientX;
-    t0Y = e.touches[0].clientY;
-    rotStartY = selectedModel ? selectedModel.rotation.y : 0;
-  } else if (e.touches.length === 2) {
+  if (e.touches.length === 2) {
+    isPinching = true;
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     pinchStartD = Math.hypot(dx, dy);
     pinchStartS = selectedModel ? selectedModel.scale.x : 1;
+  } else {
+    isPinching = false;
+  }
+  if (e.touches.length === 1) {
+    t0X = e.touches[0].clientX;
+    t0Y = e.touches[0].clientY;
+    rotStartY = selectedModel ? selectedModel.rotation.y : 0;
   }
 }, { passive: true });
 
 document.addEventListener('touchmove', e => {
   if (!selectedModel) return;
 
-  if (e.touches.length === 1) {
-    const dx = e.touches[0].clientX - t0X;
-    const dy = e.touches[0].clientY - t0Y;
-    dragDist = Math.hypot(dx, dy);
-
-    if (dragDist > CONFIG.DRAG_THRESHOLD && (activeMode === 'rotate' || activeMode === 'place')) {
-      selectedModel.rotation.y = rotStartY + dx * CONFIG.ROTATION_SENSITIVITY;
-      wasDragging = true;
-    }
-  } else if (e.touches.length === 2 && activeMode === 'scale') {
+  if (e.touches.length === 2) {
+    // pinch scaling
+    if (activeMode !== 'scale') return;
     const dx = e.touches[0].clientX - e.touches[1].clientX;
     const dy = e.touches[0].clientY - e.touches[1].clientY;
     const dist = Math.hypot(dx, dy);
@@ -474,27 +452,102 @@ document.addEventListener('touchmove', e => {
       Math.max(CONFIG.MIN_SCALE, Math.min(CONFIG.MAX_SCALE, pinchStartS * ratio))
     );
     wasDragging = true;
+  } else if (e.touches.length === 1 && (activeMode === 'rotate' || activeMode === 'place')) {
+    const dx = e.touches[0].clientX - t0X;
+    const dy = e.touches[0].clientY - t0Y;
+    dragDist = Math.hypot(dx, dy);
+    if (dragDist > CONFIG.DRAG_THRESHOLD) {
+      selectedModel.rotation.y = rotStartY + dx * CONFIG.ROTATION_SENSITIVITY;
+      wasDragging = true;
+    }
   }
 }, { passive: true });
 
-document.addEventListener('touchend', () => {
-  // Reset drag flag after a short delay to allow select event to process
-  setTimeout(() => { wasDragging = false; }, 50);
+document.addEventListener('touchend', e => {
+  if (isPinching && e.touches.length < 2) {
+    // pinch just ended
+    lastPinchEndTime = performance.now();
+    wasDragging = true;   // block next select
+    isPinching = false;
+  }
+  // keep wasDragging true for a while so the AR select event is skipped
+  setTimeout(() => {
+    if (performance.now() - lastPinchEndTime > CONFIG.PINCH_SELECT_COOLDOWN) {
+      wasDragging = false;
+    }
+  }, CONFIG.PINCH_SELECT_COOLDOWN);
 }, { passive: true });
 
-// ──────────────────── SELECT & PLACE ────────────────────
+/* ========================================================
+   UI BUTTON FIXES – prevent AR select events on the UI
+   ======================================================== */
+function stopAll(e) {
+  e.preventDefault();
+  e.stopPropagation();
+  e.stopImmediatePropagation();
+}
+
+// Color swatches
+PALETTE.forEach((c, i) => {
+  const el = document.createElement('div');
+  el.className = 'swatch' + (i === 0 ? ' active' : '');
+  el.style.background = c.css;
+  el.addEventListener('pointerdown', stopAll);
+  el.addEventListener('pointerup', (e) => {
+    stopAll(e);
+    document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
+    el.classList.add('active');
+    colorIdx = i;
+    if (selectedModel) applyColor(selectedModel, c.three);
+    showToast('Color applied');
+  });
+  $colorPanel.appendChild(el);
+});
+
+// Mode buttons
+document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
+  btn.addEventListener('pointerdown', stopAll);
+  btn.addEventListener('pointerup', (e) => {
+    stopAll(e);
+    setMode(btn.dataset.mode);
+  });
+});
+
+// Clear button – extra robust
+const clearBtn = document.getElementById('btn-clear');
+clearBtn.addEventListener('pointerdown', stopAll);
+clearBtn.addEventListener('pointerup', (e) => {
+  stopAll(e);
+  clearAllModels();
+  showToast('All models cleared');
+  updateInfo();
+});
+
+// Prevent AR session from hijacking touches on the mode bar & color panel
+[$arUI, $colorPanel].forEach(el => {
+  if (!el) return;
+  el.addEventListener('touchstart', stopAll, { capture: true });
+  el.addEventListener('touchend', stopAll, { capture: true });
+  el.addEventListener('pointerdown', stopAll, { capture: true });
+  el.addEventListener('pointerup', stopAll, { capture: true });
+});
+
+/* ========================================================
+   SELECT & PLACE (blocked after pinch)
+   ======================================================== */
 const _raycaster = new THREE.Raycaster();
 const _selectOrigin = new THREE.Vector3();
 const _selectDirection = new THREE.Vector3();
 
 function onSelect() {
-  // Ignore if user was dragging
-  if (wasDragging) {
+  // block if dragging or just finished a pinch
+  if (wasDragging || (performance.now() - lastPinchEndTime < CONFIG.PINCH_SELECT_COOLDOWN)) {
     wasDragging = false;
     return;
   }
 
-  // Use controller position/direction for AR raycasting
+  if (!controller || !controller.matrixWorld) return;
+
   const mat = controller.matrixWorld;
   _selectOrigin.setFromMatrixPosition(mat);
   _selectDirection.set(0, 0, -1).applyQuaternion(
@@ -503,15 +556,12 @@ function onSelect() {
   _raycaster.set(_selectOrigin, _selectDirection);
 
   const hits = _raycaster.intersectObjects(placedModels, true);
-
   if (hits.length > 0) {
-    // Walk up to find the placed root
     let obj = hits[0].object;
     while (obj.parent && obj.parent !== scene && !placedModels.includes(obj)) {
       obj = obj.parent;
     }
     if (placedModels.includes(obj)) {
-      // If same model tapped again in place mode, deselect it
       if (selectedModel === obj && activeMode === 'place') {
         deselect();
         showToast('DESELECTED');
@@ -522,11 +572,10 @@ function onSelect() {
     }
   }
 
-  // No hit → place new model
+  // No hit: place new model (only in 'place' mode)
   if (activeMode !== 'place' && !selectedModel) return;
   if (activeMode !== 'place') { deselect(); return; }
   if (!reticle.visible || !modelTemplate) return;
-
   placeModel();
 }
 
@@ -535,12 +584,11 @@ function placeModel() {
   placed.position.setFromMatrixPosition(reticle.matrix);
   placed.rotation.set(0, Math.random() * Math.PI * 2, 0);
 
-  // Use pre-computed half-height for faster placement
-  const halfHeight = modelTemplate.userData.halfHeight || 0;
-  if (halfHeight > 0) {
-    placed.position.y += halfHeight;
+  // use pre‑computed half‑height to avoid Box3 calculation every time
+  const halfH = modelTemplate.userData?.halfHeight || 0;
+  if (halfH) {
+    placed.position.y += halfH;
   } else {
-    // Fallback: compute on the fly (shouldn't happen if normalizeModel ran)
     const box = new THREE.Box3().setFromObject(placed);
     placed.position.y += box.getSize(new THREE.Vector3()).y / 2;
   }
@@ -559,12 +607,13 @@ function placeModel() {
   updateInfo();
 }
 
-// ──────────────────── CLEANUP ────────────────────
+/* ========================================================
+   CLEANUP (properly disposes everything)
+   ======================================================== */
 function clearAllModels() {
   placedModels.forEach(m => {
     animations.delete(m);
     scene.remove(m);
-    // Dispose geometries/materials to prevent memory leaks
     m.traverse(child => {
       if (child.isMesh) {
         if (child.geometry) child.geometry.dispose();
@@ -582,44 +631,52 @@ function clearAllModels() {
   selectedModel = null;
 }
 
-// ──────────────────── INITIALIZATION ────────────────────
+/* ========================================================
+   INITIALIZATION
+   ======================================================== */
 async function init() {
   const $btn = document.getElementById('start-btn');
 
   if (!('xr' in navigator)) {
-    $btn.textContent = 'WebXR Not Supported'; return;
+    $btn.textContent = 'WebXR Not Supported';
+    return;
   }
   const supported = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
   if (!supported) {
-    $btn.textContent = 'AR Unavailable — Use Android Chrome'; return;
+    $btn.textContent = 'AR Unavailable — Use Android Chrome';
+    return;
   }
-
   $btn.disabled = false;
   $btn.textContent = '▶ START AR PREVIEW';
 
   scene  = new THREE.Scene();
-  camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 20);
 
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.4);
-  hemi.position.set(0, 20, 0);
-  scene.add(hemi);
-  const dir = new THREE.DirectionalLight(0xffffff, 1.6);
-  dir.position.set(5, 10, 7);
+  // low‑power friendly lighting
+  const ambient = new THREE.AmbientLight(0xcccccc, 1.2);
+  scene.add(ambient);
+  const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+  dir.position.set(1, 3, 2);
   scene.add(dir);
 
+  camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.01, 20);
+
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-  renderer.setPixelRatio(devicePixelRatio);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, CONFIG.MAX_PIXEL_RATIO));
   renderer.setSize(innerWidth, innerHeight);
   renderer.xr.enabled = true;
   document.body.appendChild(renderer.domElement);
 
-  const rGeo = new THREE.RingGeometry(0.06, 0.08, 40).rotateX(-Math.PI / 2);
+  const rGeo = new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI/2); // fewer segments
   reticle = new THREE.Mesh(rGeo, new THREE.MeshBasicMaterial({ color: 0xe53935, transparent: true }));
   reticle.visible = false;
   reticle.matrixAutoUpdate = false;
   scene.add(reticle);
 
   await loadModel();
+  modelTemplate.userData = modelTemplate.userData || {};
+  // pre‑compute half‑height for fast placement
+  const box = new THREE.Box3().setFromObject(modelTemplate);
+  modelTemplate.userData.halfHeight = box.getSize(new THREE.Vector3()).y / 2;
 
   controller = renderer.xr.getController(0);
   controller.addEventListener('select', onSelect);
@@ -641,7 +698,6 @@ async function init() {
     updateInfo();
   });
 
-  // Proper session cleanup
   renderer.xr.addEventListener('sessionend', () => {
     $overlay.style.display = '';
     $arUI.classList.remove('active');
@@ -659,46 +715,38 @@ async function init() {
   });
 }
 
-// ──────────────────── RENDER LOOP ────────────────────
-let wasTracking = true;
-
+/* ========================================================
+   RENDER LOOP (throttled OSI, tracking loss detection)
+   ======================================================== */
 function onFrame(timestamp, frame) {
   if (frame) {
     const refSpace = renderer.xr.getReferenceSpace();
     const session  = renderer.xr.getSession();
 
     if (!hitTestSourceRequested) {
-      session.requestReferenceSpace('viewer').then(vs => {
-        session.requestHitTestSource({ space: vs }).then(src => {
-          hitTestSource = src;
-        }).catch(() => {
-          // Hit test source request failed — maybe try local reference space
-          session.requestReferenceSpace('local').then(ls => {
-            return session.requestHitTestSource({ space: ls });
-          }).then(src => {
-            hitTestSource = src;
-          }).catch(() => {});
-        });
+      session.requestReferenceSpace('viewer').then(vs =>
+        session.requestHitTestSource({ space: vs })
+      ).then(src => { hitTestSource = src; }).catch(() => {
+        // fallback to 'local' reference space
+        session.requestReferenceSpace('local').then(ls =>
+          session.requestHitTestSource({ space: ls })
+        ).then(src => { hitTestSource = src; }).catch(() => {});
       });
       hitTestSourceRequested = true;
     }
 
     if (hitTestSource) {
       const hits = frame.getHitTestResults(hitTestSource);
-      if (hits.length > 0) {
+      if (hits.length) {
         const pose = hits[0].getPose(refSpace);
         reticle.visible = true;
         reticle.matrix.fromArray(pose.transform.matrix);
-        
-        // Tracking is good
         if (trackingLost) {
           trackingLost = false;
           hideTrackingToast();
         }
       } else {
         reticle.visible = false;
-        
-        // No hits — could be tracking loss or no surfaces
         if (!trackingLost) {
           trackingLost = true;
           showTrackingToast('TRACKING LOST — MOVE SLOWLY');
@@ -706,13 +754,13 @@ function onFrame(timestamp, frame) {
       }
     }
 
-    // Check tracking state from frame if available
-    if (frame.getViewerPose && !hitTestSource) {
-      const viewerPose = frame.getViewerPose(refSpace);
-      if (!viewerPose && !trackingLost) {
+    // additional tracking check via viewer pose
+    if (!hitTestSource && frame.getViewerPose) {
+      const vp = frame.getViewerPose(refSpace);
+      if (!vp && !trackingLost) {
         trackingLost = true;
         showTrackingToast('TRACKING LOST — MOVE SLOWLY');
-      } else if (viewerPose && trackingLost) {
+      } else if (vp && trackingLost) {
         trackingLost = false;
         hideTrackingToast();
       }
@@ -721,7 +769,7 @@ function onFrame(timestamp, frame) {
 
   const now = performance.now();
 
-  // Play placement animations
+  // placement animations
   animations.forEach((anim, m) => {
     const t = Math.min(1, (now - anim.startTime) / CONFIG.PLACEMENT_ANIM_MS);
     const ease = 1 - Math.pow(1 - t, 3);
@@ -729,19 +777,25 @@ function onFrame(timestamp, frame) {
     if (t >= 1) animations.delete(m);
   });
 
-  // Reticle pulse animation
+  // reticle pulse
   if (reticle.visible) {
     const pulse = 1 + 0.1 * Math.sin(now * 0.005);
     reticle.scale.setScalar(pulse);
     reticle.material.opacity = 0.7 + 0.3 * Math.sin(now * 0.005);
   }
 
-  if (placedModels.length > 0) updateOSI();
+  // OSI throttling – good for low‑end devices
+  if (placedModels.length > 0 && now - lastOSIUpdate > CONFIG.OSI_UPDATE_INTERVAL) {
+    updateOSI();
+    lastOSIUpdate = now;
+  }
 
   renderer.render(scene, camera);
 }
 
-// ──────────────────── MODEL LOADING ────────────────────
+/* ========================================================
+   MODEL LOADING & NORMALIZATION
+   ======================================================== */
 function normalizeModel(obj) {
   const box  = new THREE.Box3().setFromObject(obj);
   const size = box.getSize(new THREE.Vector3());
@@ -752,17 +806,12 @@ function normalizeModel(obj) {
   else if (max > 0.5) scale = 0.01;
   obj.scale.setScalar(scale);
 
-  // Calculate new size after scaling
-  const scaledSize = size.clone().multiplyScalar(scale);
-  
-  // Center the model
   const b2 = new THREE.Box3().setFromObject(obj);
   obj.position.sub(b2.getCenter(new THREE.Vector3()));
 
-  // Store pre-computed half-height for faster placement
-  obj.userData.halfHeight = scaledSize.y / 2;
+  obj.userData = obj.userData || {};
+  obj.userData.halfHeight = (size.y * scale) / 2;
   obj.userData.scale = scale;
-  obj.userData.originalSize = scaledSize;
 }
 
 function loadModel() {
