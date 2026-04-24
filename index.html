@@ -50,6 +50,11 @@
     }
     #ar-ui.active { display: block; }
 
+    /* Make only the interactive containers receive pointer events */
+    #mode-bar, #color-panel {
+      pointer-events: auto;
+    }
+
     #info-bar {
       position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
       background: rgba(0,0,0,0.65); backdrop-filter: blur(12px);
@@ -61,51 +66,58 @@
 
     #mode-bar {
       position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%);
-      display: flex; gap: 6px; pointer-events: auto;
+      display: flex; gap: 6px;
     }
     .mode-btn {
-      padding: 9px 14px; font-size: 11px; font-weight: 700;
+      padding: 12px 16px; font-size: 12px; font-weight: 700;
       font-family: 'Courier New', monospace; letter-spacing: 0.8px;
-      background: rgba(0,0,0,0.65); backdrop-filter: blur(12px);
-      color: rgba(255,255,255,0.7); border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(0,0,0,0.75); backdrop-filter: blur(12px);
+      color: rgba(255,255,255,0.8); border: 1px solid rgba(255,255,255,0.15);
       border-radius: 4px; cursor: pointer;
       transition: background 0.15s, color 0.15s, border-color 0.15s;
       -webkit-tap-highlight-color: transparent;
       user-select: none;
+      outline: none;
+      -webkit-user-select: none;
     }
     .mode-btn.active {
-      background: rgba(229,57,53,0.75); border-color: #e53935;
-      color: #fff; box-shadow: 0 0 16px rgba(229,57,53,0.3);
+      background: rgba(229,57,53,0.85); border-color: #e53935;
+      color: #fff; box-shadow: 0 0 16px rgba(229,57,53,0.4);
     }
-    .mode-btn.danger { color: rgba(255,100,100,0.7); }
-    .mode-btn.danger:active { background: rgba(150,0,0,0.6); }
+    .mode-btn.danger { color: rgba(255,130,130,0.9); }
+    .mode-btn:active { opacity: 0.8; }
 
     #color-panel {
-      position: absolute; bottom: 82px; left: 50%; transform: translateX(-50%);
+      position: absolute; bottom: 88px; left: 50%; transform: translateX(-50%);
       display: flex; gap: 10px; padding: 12px 18px;
-      background: rgba(0,0,0,0.72); backdrop-filter: blur(16px);
-      border: 1px solid rgba(255,255,255,0.1); border-radius: 40px;
-      pointer-events: auto;
+      background: rgba(0,0,0,0.8); backdrop-filter: blur(16px);
+      border: 1px solid rgba(255,255,255,0.12); border-radius: 40px;
       opacity: 0; transform: translateX(-50%) translateY(12px);
       transition: opacity 0.2s, transform 0.2s;
     }
     #color-panel.visible {
       opacity: 1; transform: translateX(-50%) translateY(0);
+      pointer-events: auto;
     }
-    #color-panel:not(.visible) { pointer-events: none; }
+    #color-panel:not(.visible) { 
+      pointer-events: none; 
+      opacity: 0;
+    }
 
     .swatch {
-      width: 30px; height: 30px; border-radius: 50%; cursor: pointer;
+      width: 32px; height: 32px; border-radius: 50%; cursor: pointer;
       border: 2.5px solid transparent;
       transition: transform 0.15s, border-color 0.15s;
       -webkit-tap-highlight-color: transparent;
       user-select: none;
+      -webkit-user-select: none;
     }
-    .swatch.active { border-color: #fff; transform: scale(1.22); }
+    .swatch.active { border-color: #fff; transform: scale(1.25); }
+    .swatch:active { transform: scale(1.1); }
 
     #toast {
-      position: absolute; bottom: 90px; left: 50%; transform: translateX(-50%);
-      background: rgba(229,57,53,0.88); backdrop-filter: blur(12px);
+      position: absolute; bottom: 140px; left: 50%; transform: translateX(-50%);
+      background: rgba(229,57,53,0.9); backdrop-filter: blur(12px);
       color: #fff; padding: 8px 22px; border-radius: 20px;
       font-size: 12px; letter-spacing: 0.6px; pointer-events: none;
       opacity: 0; transition: opacity 0.25s; white-space: nowrap;
@@ -190,11 +202,11 @@
   <div id="tracking-toast">POINT AT A FLAT SURFACE</div>
   <div id="color-panel"></div>
   <div id="mode-bar">
-    <button class="mode-btn active" id="btn-place" data-mode="place">＋ PLACE</button>
-    <button class="mode-btn"        id="btn-rotate" data-mode="rotate">↻ ROTATE</button>
-    <button class="mode-btn"        id="btn-scale"  data-mode="scale">⊕ SCALE</button>
-    <button class="mode-btn"        id="btn-color"  data-mode="color">● COLOR</button>
-    <button class="mode-btn danger" id="btn-clear">✕ CLEAR</button>
+    <button class="mode-btn active" data-mode="place">＋ PLACE</button>
+    <button class="mode-btn"        data-mode="rotate">↻ ROTATE</button>
+    <button class="mode-btn"        data-mode="scale">⊕ SCALE</button>
+    <button class="mode-btn"        data-mode="color">● COLOR</button>
+    <button class="mode-btn danger" data-mode="clear">✕ CLEAR</button>
   </div>
   <div id="toast"></div>
   <div id="sel-flash"></div>
@@ -216,13 +228,11 @@ const CONFIG = {
   MIN_SCALE: 0.05,
   MAX_SCALE: 10,
   OSI_MARGIN: 28,
-  MODEL_PATH_GLB: 'model.glb',
-  MODEL_PATH_OBJ: 'model.obj',
-  MAX_PIXEL_RATIO: 2,
   OSI_UPDATE_INTERVAL: 100,
   PINCH_SELECT_COOLDOWN: 400,
-  TRACKING_LOST_DELAY: 2000,   // ms before showing "tracking lost" toast
-  HIT_TEST_RETRY_MS: 500,      // retry hit‑test source if first attempts fail
+  TRACKING_LOST_DELAY: 2000,
+  HIT_TEST_RETRY_MS: 500,
+  MAX_PIXEL_RATIO: 2,
 };
 
 /* ========================================================
@@ -245,7 +255,7 @@ let isPinching  = false;
 let lastPinchEndTime = 0;
 
 let trackingLost = false;
-let lastHitTime = 0;                // timestamp when last hit was received
+let lastHitTime = 0;
 let trackingLostToastTimer = null;
 let hitTestRetryTimer = null;
 
@@ -301,6 +311,12 @@ function hideTrackingToast() {
 }
 
 function setMode(m) {
+  if (m === 'clear') {
+    clearAllModels();
+    showToast('All models cleared');
+    updateInfo();
+    return;
+  }
   activeMode = m;
   document.querySelectorAll('.mode-btn[data-mode]').forEach(b =>
     b.classList.toggle('active', b.dataset.mode === m));
@@ -425,7 +441,7 @@ function updateOSI() {
 }
 
 /* ========================================================
-   TOUCH HANDLING (pinch + drag)
+   TOUCH HANDLING – only for pinch and drag manipulation
    ======================================================== */
 document.addEventListener('touchstart', e => {
   dragDist = 0;
@@ -482,21 +498,16 @@ document.addEventListener('touchend', e => {
 }, { passive: true });
 
 /* ========================================================
-   UI BUTTON FIXES – pointer capture to avoid AR hijack
+   UI BUTTONS – simple click handlers, no over-engineering
    ======================================================== */
-function stopAll(e) {
-  e.preventDefault();
-  e.stopPropagation();
-  e.stopImmediatePropagation();
-}
 
+// Build color swatches
 PALETTE.forEach((c, i) => {
   const el = document.createElement('div');
   el.className = 'swatch' + (i === 0 ? ' active' : '');
   el.style.background = c.css;
-  el.addEventListener('pointerdown', stopAll);
-  el.addEventListener('pointerup', (e) => {
-    stopAll(e);
+  el.addEventListener('click', (e) => {
+    e.stopPropagation();
     document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
     el.classList.add('active');
     colorIdx = i;
@@ -506,29 +517,13 @@ PALETTE.forEach((c, i) => {
   $colorPanel.appendChild(el);
 });
 
+// Mode buttons – unified handler for both mode and clear
 document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
-  btn.addEventListener('pointerdown', stopAll);
-  btn.addEventListener('pointerup', (e) => {
-    stopAll(e);
-    setMode(btn.dataset.mode);
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const mode = btn.dataset.mode;
+    setMode(mode);
   });
-});
-
-const clearBtn = document.getElementById('btn-clear');
-clearBtn.addEventListener('pointerdown', stopAll);
-clearBtn.addEventListener('pointerup', (e) => {
-  stopAll(e);
-  clearAllModels();
-  showToast('All models cleared');
-  updateInfo();
-});
-
-[$arUI, $colorPanel].forEach(el => {
-  if (!el) return;
-  el.addEventListener('touchstart', stopAll, { capture: true });
-  el.addEventListener('touchend', stopAll, { capture: true });
-  el.addEventListener('pointerdown', stopAll, { capture: true });
-  el.addEventListener('pointerup', stopAll, { capture: true });
 });
 
 /* ========================================================
@@ -684,7 +679,6 @@ async function init() {
   $btn.addEventListener('click', () => {
     $overlay.style.display = 'none';
     $arUI.classList.add('active');
-    // Show initial hint
     showTrackingToast('POINT AT A FLAT SURFACE', true);
     arBtn.click();
     renderer.setAnimationLoop(onFrame);
@@ -710,7 +704,7 @@ async function init() {
 }
 
 /* ========================================================
-   RENDER LOOP (with diagnostic logs)
+   RENDER LOOP
    ======================================================== */
 function requestHitTestSource(session) {
   session.requestReferenceSpace('viewer').then(viewerSpace => {
@@ -727,7 +721,6 @@ function requestHitTestSource(session) {
       console.log('[AR] Hit test source obtained (local space)');
     }).catch(err => {
       console.error('[AR] Hit test source unavailable:', err);
-      // Retry after a delay
       clearTimeout(hitTestRetryTimer);
       hitTestRetryTimer = setTimeout(() => {
         if (!hitTestSource) {
@@ -771,7 +764,6 @@ function onFrame(timestamp, frame) {
       }
     } else {
       reticle.visible = false;
-      // Wait before declaring tracking lost
       if (!trackingLost && now - lastHitTime > CONFIG.TRACKING_LOST_DELAY) {
         trackingLost = true;
         showTrackingToast('POINT AT A FLAT SURFACE');
@@ -779,7 +771,6 @@ function onFrame(timestamp, frame) {
       }
     }
   } else {
-    // No hit-test source yet; rely on viewer pose to guess tracking
     if (frame.getViewerPose) {
       const vp = frame.getViewerPose(refSpace);
       if (!vp && !trackingLost) {
@@ -840,12 +831,12 @@ function normalizeModel(obj) {
 
 function loadModel() {
   return new Promise(resolve => {
-    new GLTFLoader().load(CONFIG.MODEL_PATH_GLB, gltf => {
+    new GLTFLoader().load(CONFIG.MODEL_PATH_GLB || 'model.glb', gltf => {
       modelTemplate = gltf.scene;
       normalizeModel(modelTemplate);
       resolve();
     }, undefined, () => {
-      new OBJLoader().load(CONFIG.MODEL_PATH_OBJ, obj => {
+      new OBJLoader().load(CONFIG.MODEL_PATH_OBJ || 'model.obj', obj => {
         obj.traverse(child => {
           if (child.isMesh)
             child.material = new THREE.MeshStandardMaterial({ color: 0xd32f2f, roughness: 0.3, metalness: 0.1 });
