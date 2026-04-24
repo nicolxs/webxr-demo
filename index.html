@@ -90,7 +90,7 @@
     #color-panel.visible {
       opacity: 1; transform: translateX(-50%) translateY(0);
     }
-    #color-panel:not(.visible) { pointer-events: none; } /* [FIX 6] */
+    #color-panel:not(.visible) { pointer-events: none; }
 
     .swatch {
       width: 30px; height: 30px; border-radius: 50%; cursor: pointer;
@@ -108,6 +108,15 @@
       opacity: 0; transition: opacity 0.25s; white-space: nowrap;
     }
     #toast.show { opacity: 1; }
+
+    #tracking-toast {
+      position: absolute; top: 70px; left: 50%; transform: translateX(-50%);
+      background: rgba(255,152,0,0.88); backdrop-filter: blur(12px);
+      color: #fff; padding: 8px 22px; border-radius: 20px;
+      font-size: 12px; letter-spacing: 0.6px; pointer-events: none;
+      opacity: 0; transition: opacity 0.25s; white-space: nowrap;
+    }
+    #tracking-toast.show { opacity: 1; }
 
     .osi {
       position: absolute; pointer-events: none;
@@ -175,6 +184,7 @@
 
 <div id="ar-ui">
   <div id="info-bar">TAP RING TO PLACE</div>
+  <div id="tracking-toast">TRACKING LOST — MOVE SLOWLY</div>
   <div id="color-panel"></div>
   <div id="mode-bar">
     <button class="mode-btn active" id="btn-place" data-mode="place">＋ PLACE</button>
@@ -193,6 +203,19 @@ import { ARButton }   from 'three/addons/webxr/ARButton.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OBJLoader }  from 'three/addons/loaders/OBJLoader.js';
 
+// ──────────────────── CONFIGURATION ────────────────────
+const CONFIG = {
+  ROTATION_SENSITIVITY: 0.009,
+  DRAG_THRESHOLD: 6,
+  PLACEMENT_ANIM_MS: 380,
+  MIN_SCALE: 0.05,
+  MAX_SCALE: 10,
+  OSI_MARGIN: 28,
+  MODEL_PATH_GLB: 'model.glb',
+  MODEL_PATH_OBJ: 'model.obj',
+};
+// ───────────────────────────────────────────────────────
+
 let camera, scene, renderer, reticle, controller;
 let hitTestSource = null, hitTestSourceRequested = false;
 let modelTemplate  = null;
@@ -201,11 +224,14 @@ let selectedModel  = null;
 
 let activeMode  = 'place';
 let dragDist    = 0;
-let wasDragging = false; // [FIX 8] separate flag for drag vs tap
+let wasDragging = false;
 let t0X = 0, t0Y = 0;
 let rotStartY   = 0;
 let pinchStartD = 0;
 let pinchStartS = 1;
+
+let trackingLost = false;
+let trackingToastTimer = null;
 
 const animations = new Map();
 
@@ -224,19 +250,20 @@ let colorIdx = 0;
 
 const DIR8 = ['→','↘','↓','↙','←','↖','↑','↗'];
 
-const $overlay    = document.getElementById('overlay');
-const $arUI       = document.getElementById('ar-ui');
-const $infoBar    = document.getElementById('info-bar');
-const $toast      = document.getElementById('toast');
-const $colorPanel = document.getElementById('color-panel');
-const $selFlash   = document.getElementById('sel-flash');
+const $overlay      = document.getElementById('overlay');
+const $arUI         = document.getElementById('ar-ui');
+const $infoBar      = document.getElementById('info-bar');
+const $toast        = document.getElementById('toast');
+const $trackingToast = document.getElementById('tracking-toast');
+const $colorPanel   = document.getElementById('color-panel');
+const $selFlash     = document.getElementById('sel-flash');
 
 PALETTE.forEach((c, i) => {
   const el = document.createElement('div');
   el.className = 'swatch' + (i === 0 ? ' active' : '');
   el.style.background = c.css;
-  el.addEventListener('click', (e) => { // [FIX 2] capture event
-    e.stopPropagation(); // [FIX 2] prevent bubbling to document touch
+  el.addEventListener('click', (e) => {
+    e.stopPropagation();
     document.querySelectorAll('.swatch').forEach(s => s.classList.remove('active'));
     el.classList.add('active');
     colorIdx = i;
@@ -246,7 +273,7 @@ PALETTE.forEach((c, i) => {
   $colorPanel.appendChild(el);
 });
 
-// [FIX 2] Stop touch propagation on all UI buttons
+// Stop touch propagation on all UI buttons
 document.querySelectorAll('.mode-btn, .swatch').forEach(el => {
   el.addEventListener('touchstart', e => e.stopPropagation(), { passive: true });
   el.addEventListener('touchmove',  e => e.stopPropagation(), { passive: true });
@@ -257,7 +284,7 @@ document.querySelectorAll('.mode-btn[data-mode]').forEach(btn => {
   btn.addEventListener('click', () => setMode(btn.dataset.mode));
 });
 document.getElementById('btn-clear').addEventListener('click', () => {
-  clearAllModels(); // [FIX 3] centralized cleanup
+  clearAllModels();
   showToast('All models cleared');
   updateInfo();
 });
@@ -290,6 +317,20 @@ function showToast(msg, ms = 2200) {
   toastTimer = setTimeout(() => $toast.classList.remove('show'), ms);
 }
 
+function showTrackingToast(msg, ms = 0) {
+  $trackingToast.textContent = msg;
+  $trackingToast.classList.add('show');
+  clearTimeout(trackingToastTimer);
+  if (ms > 0) {
+    trackingToastTimer = setTimeout(() => $trackingToast.classList.remove('show'), ms);
+  }
+}
+
+function hideTrackingToast() {
+  $trackingToast.classList.remove('show');
+  clearTimeout(trackingToastTimer);
+}
+
 function applyColor(obj, hex) {
   obj.traverse(child => {
     if (!child.isMesh) return;
@@ -305,6 +346,7 @@ function setEmissive(obj, hex) {
     mats.forEach(mat => { if (mat.emissive) mat.emissive.setHex(hex); });
   });
 }
+
 function selectModel(m) {
   if (selectedModel) setEmissive(selectedModel, 0x000000);
   selectedModel = m;
@@ -316,12 +358,14 @@ function selectModel(m) {
     : activeMode === 'color' ? 'PICK A COLOR'
     : 'SWITCH MODE TO EDIT'));
 }
+
 function deselect() {
   if (!selectedModel) return;
   setEmissive(selectedModel, 0x000000);
   selectedModel = null;
   updateInfo();
 }
+
 function flashSelectionRing() {
   $selFlash.classList.remove('pop');
   void $selFlash.offsetWidth;
@@ -337,6 +381,7 @@ function spawnRipple() {
   setTimeout(() => r.remove(), 600);
 }
 
+// ──────────────────── OSI (Off-Screen Indicators) ────────────────────
 const osiEls = [];
 function getOSI(i) {
   if (!osiEls[i]) {
@@ -351,7 +396,7 @@ function getOSI(i) {
 const _projV = new THREE.Vector3();
 function updateOSI() {
   const W = window.innerWidth, H = window.innerHeight;
-  const margin = 28;
+  const margin = CONFIG.OSI_MARGIN;
   placedModels.forEach((m, i) => {
     const el = getOSI(i);
     m.getWorldPosition(_projV);
@@ -371,7 +416,7 @@ function updateOSI() {
       const cx = W / 2, cy = H / 2;
       let dx = sx - cx, dy = sy - cy;
 
-      // [FIX 5] Compute angle BEFORE flipping for behind-camera
+      // Compute angle BEFORE flipping for behind-camera
       let angle = Math.atan2(dy, dx);
       if (behind) {
         dx = -dx;
@@ -392,7 +437,7 @@ function updateOSI() {
   });
 }
 
-// [FIX 8] Clean touch handling with separate wasDragging flag
+// ──────────────────── TOUCH HANDLING ────────────────────
 document.addEventListener('touchstart', e => {
   dragDist = 0;
   wasDragging = false;
@@ -416,9 +461,9 @@ document.addEventListener('touchmove', e => {
     const dy = e.touches[0].clientY - t0Y;
     dragDist = Math.hypot(dx, dy);
 
-    if (dragDist > 6 && (activeMode === 'rotate' || activeMode === 'place')) {
-      selectedModel.rotation.y = rotStartY + dx * 0.009;
-      wasDragging = true; // [FIX 8] flag that this was a drag, not a tap
+    if (dragDist > CONFIG.DRAG_THRESHOLD && (activeMode === 'rotate' || activeMode === 'place')) {
+      selectedModel.rotation.y = rotStartY + dx * CONFIG.ROTATION_SENSITIVITY;
+      wasDragging = true;
     }
   } else if (e.touches.length === 2 && activeMode === 'scale') {
     const dx = e.touches[0].clientX - e.touches[1].clientX;
@@ -426,37 +471,118 @@ document.addEventListener('touchmove', e => {
     const dist = Math.hypot(dx, dy);
     const ratio = dist / (pinchStartD || 1);
     selectedModel.scale.setScalar(
-      Math.max(0.05, Math.min(10, pinchStartS * ratio))
+      Math.max(CONFIG.MIN_SCALE, Math.min(CONFIG.MAX_SCALE, pinchStartS * ratio))
     );
     wasDragging = true;
   }
 }, { passive: true });
 
 document.addEventListener('touchend', () => {
-  // [FIX 8] No setTimeout needed; wasDragging is set during move, cleared after select reads it
+  // Reset drag flag after a short delay to allow select event to process
+  setTimeout(() => { wasDragging = false; }, 50);
 }, { passive: true });
 
-// [FIX 3, 9] Centralized cleanup function
+// ──────────────────── SELECT & PLACE ────────────────────
+const _raycaster = new THREE.Raycaster();
+const _selectOrigin = new THREE.Vector3();
+const _selectDirection = new THREE.Vector3();
+
+function onSelect() {
+  // Ignore if user was dragging
+  if (wasDragging) {
+    wasDragging = false;
+    return;
+  }
+
+  // Use controller position/direction for AR raycasting
+  const mat = controller.matrixWorld;
+  _selectOrigin.setFromMatrixPosition(mat);
+  _selectDirection.set(0, 0, -1).applyQuaternion(
+    new THREE.Quaternion().setFromRotationMatrix(mat)
+  );
+  _raycaster.set(_selectOrigin, _selectDirection);
+
+  const hits = _raycaster.intersectObjects(placedModels, true);
+
+  if (hits.length > 0) {
+    // Walk up to find the placed root
+    let obj = hits[0].object;
+    while (obj.parent && obj.parent !== scene && !placedModels.includes(obj)) {
+      obj = obj.parent;
+    }
+    if (placedModels.includes(obj)) {
+      // If same model tapped again in place mode, deselect it
+      if (selectedModel === obj && activeMode === 'place') {
+        deselect();
+        showToast('DESELECTED');
+        return;
+      }
+      selectModel(obj);
+      return;
+    }
+  }
+
+  // No hit → place new model
+  if (activeMode !== 'place' && !selectedModel) return;
+  if (activeMode !== 'place') { deselect(); return; }
+  if (!reticle.visible || !modelTemplate) return;
+
+  placeModel();
+}
+
+function placeModel() {
+  const placed = modelTemplate.clone(true);
+  placed.position.setFromMatrixPosition(reticle.matrix);
+  placed.rotation.set(0, Math.random() * Math.PI * 2, 0);
+
+  // Use pre-computed half-height for faster placement
+  const halfHeight = modelTemplate.userData.halfHeight || 0;
+  if (halfHeight > 0) {
+    placed.position.y += halfHeight;
+  } else {
+    // Fallback: compute on the fly (shouldn't happen if normalizeModel ran)
+    const box = new THREE.Box3().setFromObject(placed);
+    placed.position.y += box.getSize(new THREE.Vector3()).y / 2;
+  }
+
+  applyColor(placed, PALETTE[colorIdx].three);
+
+  const targetScale = placed.scale.x;
+  placed.scale.setScalar(0.001);
+  animations.set(placed, { startTime: performance.now(), targetScale });
+
+  scene.add(placed);
+  placedModels.push(placed);
+
+  spawnRipple();
+  showToast(`MODEL ${placedModels.length} PLACED ✓`);
+  updateInfo();
+}
+
+// ──────────────────── CLEANUP ────────────────────
 function clearAllModels() {
   placedModels.forEach(m => {
-    animations.delete(m); // [FIX 3] clear animations
+    animations.delete(m);
     scene.remove(m);
     // Dispose geometries/materials to prevent memory leaks
     m.traverse(child => {
       if (child.isMesh) {
         if (child.geometry) child.geometry.dispose();
         const mats = Array.isArray(child.material) ? child.material : [child.material];
-        mats.forEach(mat => mat.dispose());
+        mats.forEach(mat => {
+          if (mat && typeof mat.dispose === 'function') mat.dispose();
+        });
       }
     });
   });
   placedModels.length = 0;
-  animations.clear(); // [FIX 3] ensure all gone
+  animations.clear();
   document.querySelectorAll('.osi').forEach(el => el.remove());
   osiEls.length = 0;
   selectedModel = null;
 }
 
+// ──────────────────── INITIALIZATION ────────────────────
 async function init() {
   const $btn = document.getElementById('start-btn');
 
@@ -515,13 +641,15 @@ async function init() {
     updateInfo();
   });
 
-  // [FIX 9] Proper session cleanup
+  // Proper session cleanup
   renderer.xr.addEventListener('sessionend', () => {
     $overlay.style.display = '';
     $arUI.classList.remove('active');
     hitTestSourceRequested = false;
     hitTestSource = null;
-    clearAllModels(); // [FIX 9] use centralized cleanup
+    trackingLost = false;
+    hideTrackingToast();
+    clearAllModels();
   });
 
   window.addEventListener('resize', () => {
@@ -531,70 +659,8 @@ async function init() {
   });
 }
 
-// [FIX 1, 7, 8] Rewritten select handler
-const _raycaster = new THREE.Raycaster();
-const _selectOrigin = new THREE.Vector3();
-const _selectDirection = new THREE.Vector3();
-
-function onSelect() {
-  // [FIX 8] Ignore if user was dragging
-  if (wasDragging) {
-    wasDragging = false;
-    return;
-  }
-
-  // [FIX 1] Use controller position/direction for AR raycasting
-  // The controller's matrix is in world space and synced by WebXR
-  const mat = controller.matrixWorld;
-  _selectOrigin.setFromMatrixPosition(mat);
-  _selectDirection.set(0, 0, -1).applyQuaternion(
-    new THREE.Quaternion().setFromRotationMatrix(mat)
-  );
-  _raycaster.set(_selectOrigin, _selectDirection);
-
-  const hits = _raycaster.intersectObjects(placedModels, true);
-
-  if (hits.length > 0) {
-    // [FIX 7] Walk up to find the placed root (stop at scene, not just any parent)
-    let obj = hits[0].object;
-    while (obj.parent && obj.parent !== scene && !placedModels.includes(obj)) {
-      obj = obj.parent;
-    }
-    if (placedModels.includes(obj)) {
-      selectModel(obj);
-      return;
-    }
-  }
-
-  // No hit → place new model
-  if (activeMode !== 'place' && !selectedModel) return;
-  if (activeMode !== 'place') { deselect(); return; }
-  if (!reticle.visible || !modelTemplate) return;
-
-  placeModel();
-}
-
-function placeModel() {
-  const placed = modelTemplate.clone(true);
-  placed.position.setFromMatrixPosition(reticle.matrix);
-  placed.rotation.set(0, Math.random() * Math.PI * 2, 0);
-
-  const box = new THREE.Box3().setFromObject(placed);
-  placed.position.y += box.getSize(new THREE.Vector3()).y / 2;
-
-  applyColor(placed, PALETTE[colorIdx].three);
-
-  const targetScale = placed.scale.x;
-  placed.scale.setScalar(0.001);
-  animations.set(placed, { startTime: performance.now(), targetScale });
-
-  scene.add(placed);
-  placedModels.push(placed);
-
-  spawnRipple();
-  showToast(`MODEL ${placedModels.length} PLACED ✓`);
-  updateInfo();
-}
+// ──────────────────── RENDER LOOP ────────────────────
+let wasTracking = true;
 
 function onFrame(timestamp, frame) {
   if (frame) {
@@ -602,9 +668,18 @@ function onFrame(timestamp, frame) {
     const session  = renderer.xr.getSession();
 
     if (!hitTestSourceRequested) {
-      session.requestReferenceSpace('viewer').then(vs =>
-        session.requestHitTestSource({ space: vs }).then(src => { hitTestSource = src; })
-      );
+      session.requestReferenceSpace('viewer').then(vs => {
+        session.requestHitTestSource({ space: vs }).then(src => {
+          hitTestSource = src;
+        }).catch(() => {
+          // Hit test source request failed — maybe try local reference space
+          session.requestReferenceSpace('local').then(ls => {
+            return session.requestHitTestSource({ space: ls });
+          }).then(src => {
+            hitTestSource = src;
+          }).catch(() => {});
+        });
+      });
       hitTestSourceRequested = true;
     }
 
@@ -614,21 +689,47 @@ function onFrame(timestamp, frame) {
         const pose = hits[0].getPose(refSpace);
         reticle.visible = true;
         reticle.matrix.fromArray(pose.transform.matrix);
+        
+        // Tracking is good
+        if (trackingLost) {
+          trackingLost = false;
+          hideTrackingToast();
+        }
       } else {
         reticle.visible = false;
+        
+        // No hits — could be tracking loss or no surfaces
+        if (!trackingLost) {
+          trackingLost = true;
+          showTrackingToast('TRACKING LOST — MOVE SLOWLY');
+        }
+      }
+    }
+
+    // Check tracking state from frame if available
+    if (frame.getViewerPose && !hitTestSource) {
+      const viewerPose = frame.getViewerPose(refSpace);
+      if (!viewerPose && !trackingLost) {
+        trackingLost = true;
+        showTrackingToast('TRACKING LOST — MOVE SLOWLY');
+      } else if (viewerPose && trackingLost) {
+        trackingLost = false;
+        hideTrackingToast();
       }
     }
   }
 
   const now = performance.now();
 
+  // Play placement animations
   animations.forEach((anim, m) => {
-    const t = Math.min(1, (now - anim.startTime) / 380);
+    const t = Math.min(1, (now - anim.startTime) / CONFIG.PLACEMENT_ANIM_MS);
     const ease = 1 - Math.pow(1 - t, 3);
     m.scale.setScalar(anim.targetScale * ease);
     if (t >= 1) animations.delete(m);
   });
 
+  // Reticle pulse animation
   if (reticle.visible) {
     const pulse = 1 + 0.1 * Math.sin(now * 0.005);
     reticle.scale.setScalar(pulse);
@@ -640,6 +741,7 @@ function onFrame(timestamp, frame) {
   renderer.render(scene, camera);
 }
 
+// ──────────────────── MODEL LOADING ────────────────────
 function normalizeModel(obj) {
   const box  = new THREE.Box3().setFromObject(obj);
   const size = box.getSize(new THREE.Vector3());
@@ -650,18 +752,27 @@ function normalizeModel(obj) {
   else if (max > 0.5) scale = 0.01;
   obj.scale.setScalar(scale);
 
+  // Calculate new size after scaling
+  const scaledSize = size.clone().multiplyScalar(scale);
+  
+  // Center the model
   const b2 = new THREE.Box3().setFromObject(obj);
   obj.position.sub(b2.getCenter(new THREE.Vector3()));
+
+  // Store pre-computed half-height for faster placement
+  obj.userData.halfHeight = scaledSize.y / 2;
+  obj.userData.scale = scale;
+  obj.userData.originalSize = scaledSize;
 }
 
 function loadModel() {
   return new Promise(resolve => {
-    new GLTFLoader().load('model.glb', gltf => {
+    new GLTFLoader().load(CONFIG.MODEL_PATH_GLB, gltf => {
       modelTemplate = gltf.scene;
       normalizeModel(modelTemplate);
       resolve();
     }, undefined, () => {
-      new OBJLoader().load('model.obj', obj => {
+      new OBJLoader().load(CONFIG.MODEL_PATH_OBJ, obj => {
         obj.traverse(child => {
           if (child.isMesh)
             child.material = new THREE.MeshStandardMaterial({ color: 0xd32f2f, roughness: 0.3, metalness: 0.1 });
@@ -681,6 +792,7 @@ function loadModel() {
         stud.position.set(0, 0.010, 0);
         b.add(stud);
         modelTemplate = b;
+        normalizeModel(modelTemplate);
         resolve();
       });
     });
